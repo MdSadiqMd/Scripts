@@ -122,7 +122,7 @@ func processExcel(filePath, secretKey string) error {
 			name, err := fetchUserName(e.UserID, secretKey)
 			if err != nil {
 				name = fmt.Sprintf("Unknown User (%s)", e.UserID)
-				fmt.Fprintf(os.Stderr, "⚠️ Failed to fetch %s: %v\n", e.UserID, err)
+				fmt.Printf("⚠️ Failed to fetch %s: %v\n", e.UserID, err)
 			}
 			results <- result{Row: e.Row, UserName: name}
 			<-sem
@@ -163,23 +163,24 @@ func validateFile(path string) error {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "❌ Please provide the Excel file path")
+		fmt.Println("❌ Please provide the Excel file path")
 		os.Exit(1)
 	}
+
 	filePath := os.Args[1]
 	if err := validateFile(filePath); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		fmt.Printf("❌ %v\n", err)
 		os.Exit(1)
 	}
 
 	secretKey := envClerkSecretKey
 	if secretKey == "" {
-		fmt.Fprintln(os.Stderr, "❌ CLERK_SECRET_KEY not set")
+		fmt.Println("❌ CLERK_SECRET_KEY not set")
 		os.Exit(1)
 	}
 
 	if err := processExcel(filePath, secretKey); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Script failed: %v\n", err)
+		fmt.Printf("❌ Script failed: %v\n", err)
 		os.Exit(1)
 	}
 }
