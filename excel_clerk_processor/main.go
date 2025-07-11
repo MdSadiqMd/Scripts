@@ -1,4 +1,5 @@
 // A script that reads an Excel file, extracts Clerk user IDs from a specified column, fetches user names concurrently via the Clerk API, and writes an updated Excel file with the resolved usernames in a new column
+// go run main.go <path_of_excel_file>
 package main
 
 import (
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MdSadiqMd/clerk-to-usernames-excel/internal/models"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -22,26 +24,6 @@ const (
 	clerkAPIBase       = "https://api.clerk.dev/v1/users"
 	requestTimeout     = 10 * time.Second
 )
-
-type ClerkUser struct {
-	FirstName      string `json:"first_name"`
-	LastName       string `json:"last_name"`
-	Username       string `json:"username"`
-	EmailAddresses []struct {
-		EmailAddress string `json:"email_address"`
-	} `json:"email_addresses"`
-}
-
-type entry struct {
-	Row    int
-	UserID string
-}
-
-type result struct {
-	Row      int
-	UserName string
-	Err      error
-}
 
 func fetchUserName(userID, secretKey string) (string, error) {
 	fmt.Println("🔍 Fetching user:", userID)
@@ -63,7 +45,7 @@ func fetchUserName(userID, secretKey string) (string, error) {
 		return "", fmt.Errorf("clerk API returned status %d", resp.StatusCode)
 	}
 
-	var user ClerkUser
+	var user models.ClerkUser
 	body, _ := ioutil.ReadAll(resp.Body)
 	if err := json.Unmarshal(body, &user); err != nil {
 		return "", err
@@ -99,12 +81,12 @@ func processExcel(filePath, secretKey string) error {
 		return err
 	}
 
-	var entries []entry
+	var entries []models.Entry
 	for r := 1; r < len(rows); r++ {
 		if len(rows[r]) >= userIDsColumnIndex {
 			uid := stringTrim(rows[r][userIDsColumnIndex-1])
 			if uid != "" {
-				entries = append(entries, entry{Row: r + 1, UserID: uid})
+				entries = append(entries, models.Entry{Row: r + 1, UserID: uid})
 			}
 		}
 	}
@@ -114,18 +96,18 @@ func processExcel(filePath, secretKey string) error {
 	sem := make(chan struct{}, batchSize)
 
 	var wg sync.WaitGroup
-	results := make(chan result, len(entries))
+	results := make(chan models.Result, len(entries))
 	for _, ent := range entries {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(e entry) {
+		go func(e models.Entry) {
 			defer wg.Done()
 			name, err := fetchUserName(e.UserID, secretKey)
 			if err != nil {
 				name = fmt.Sprintf("Unknown User (%s)", e.UserID)
 				fmt.Printf("⚠️ Failed to fetch %s: %v\n", e.UserID, err)
 			}
-			results <- result{Row: e.Row, UserName: name}
+			results <- models.Result{Row: e.Row, UserName: name}
 			<-sem
 		}(ent)
 	}
