@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/MdSadiqMd/clerk-to-usernames-excel/internal/models"
+	models "github.com/MdSadiqMd/clerk-to-usernames-excel/internal"
 	"github.com/MdSadiqMd/clerk-to-usernames-excel/pkg"
 	"github.com/xuri/excelize/v2"
 )
