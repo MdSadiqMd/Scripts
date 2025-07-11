@@ -1,3 +1,4 @@
+// A script that reads an Excel file, extracts Clerk user IDs from a specified column, fetches user names concurrently via the Clerk API, and writes an updated Excel file with the resolved usernames in a new column
 package main
 
 import (
@@ -15,9 +16,9 @@ import (
 )
 
 const (
-	userIDsColumnIndex = 5
-	batchSize          = 10
-	envClerkSecretKey  = ""
+	userIDsColumnIndex = 5  // Coloumn in excel which have userIds
+	batchSize          = 10 // Size of Batches that needed to be processed at a time
+	ClerkSecretKey     = "" // Clerk Secret Key
 	clerkAPIBase       = "https://api.clerk.dev/v1/users"
 	requestTimeout     = 10 * time.Second
 )
@@ -173,7 +174,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	secretKey := envClerkSecretKey
+	secretKey := ClerkSecretKey
 	if secretKey == "" {
 		fmt.Println("❌ CLERK_SECRET_KEY not set")
 		os.Exit(1)
