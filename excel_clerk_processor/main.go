@@ -4,7 +4,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MdSadiqMd/clerk-to-usernames-excel/internal/models"
+	"github.com/MdSadiqMd/clerk-to-usernames-excel/pkg"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -131,39 +131,26 @@ func processExcel(filePath, secretKey string) error {
 	return nil
 }
 
-func validateFile(path string) error {
-	info, err := os.Stat(path)
-	if os.IsNotExist(err) || info.IsDir() {
-		return errors.New("file not found or is a directory")
-	}
-
-	ext := filepath.Ext(path)
-	if ext != ".xlsx" && ext != ".xls" {
-		return errors.New("file must be an Excel file (.xlsx or .xls)")
-	}
-	return nil
-}
-
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("❌ Please provide the Excel file path")
+		fmt.Println("Please provide the Excel file path")
 		os.Exit(1)
 	}
 
 	filePath := os.Args[1]
-	if err := validateFile(filePath); err != nil {
-		fmt.Printf("❌ %v\n", err)
+	if err := pkg.ValidateFile(filePath); err != nil {
+		fmt.Println(err)
 		os.Exit(1)
 	}
 
 	secretKey := ClerkSecretKey
 	if secretKey == "" {
-		fmt.Println("❌ CLERK_SECRET_KEY not set")
+		fmt.Println("CLERK_SECRET_KEY not set")
 		os.Exit(1)
 	}
 
 	if err := processExcel(filePath, secretKey); err != nil {
-		fmt.Printf("❌ Script failed: %v\n", err)
+		fmt.Printf("Script failed: %v\n", err)
 		os.Exit(1)
 	}
 }
