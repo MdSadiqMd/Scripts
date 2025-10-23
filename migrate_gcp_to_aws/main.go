@@ -38,13 +38,13 @@ type Config struct {
 // LoadConfig loads configuration from JSON file or returns defaults
 func LoadConfig(configPath string) (*Config, error) {
 	config := &Config{
-		GCSBucket:          "",                                                                           // GCS bucket name
-		S3Bucket:           "",                                                                           // S3 bucket name
-		AWSCredentialsFile: "/home/sadiq/projects/scripts/migrate_gcp_to_aws/.aws/credentials",           // AWS credentials file path
-		AWSRegion:          "ap-south-1",                                                                 // AWS region
-		LogFile:            "/home/sadiq/projects/scripts/migrate_gcp_to_aws/logs/migrate_gcp_to_s3.log", // log file path
-		CutoffDateStr:      "2025-09-07",                                                                 // date from which to migrate files
-		MaxWorkers:         10,
+		GCSBucket:          "",
+		S3Bucket:           "",
+		AWSCredentialsFile: "/home/sadiq/projects/scripts/migrate_gcp_to_aws/.aws/credentials",
+		AWSRegion:          "",
+		LogFile:            "/home/sadiq/projects/scripts/migrate_gcp_to_aws/logs/migrate_gcp_to_s3.log",
+		CutoffDateStr:      "2025-09-07",
+		MaxWorkers:         20,
 		VideoExtensions:    []string{".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"},
 	}
 
@@ -73,7 +73,6 @@ type Stats struct {
 	totalFiles      atomic.Int64
 	copiedFiles     atomic.Int64
 	skippedExisting atomic.Int64
-	skippedDate     atomic.Int64
 	errorFiles      atomic.Int64
 }
 
@@ -126,16 +125,17 @@ func isVideoFile(filename string, extensions []string) bool {
 	return false
 }
 
-// Extract date from folder path (e.g., "2025-09-07/file.mp4" -> "2025-09-07")
+// Extract date from folder path (e.g., "port1/2025-09-07/file.mp4" -> "2025-09-07")
+// Path format: port1/2025-07-15/recording_...
 func extractDateFromPath(path string) (time.Time, error) {
-	// Get the first part of the path (folder name)
+	// Get the second part of the path (date folder)
 	parts := strings.Split(path, "/")
-	if len(parts) == 0 {
-		return time.Time{}, fmt.Errorf("empty path")
+	if len(parts) < 2 {
+		return time.Time{}, fmt.Errorf("path does not have enough segments: %s", path)
 	}
 
-	// Try to parse the first part as a date (YYYY-MM-DD format)
-	dateStr := parts[0]
+	// Try to parse the second part as a date (YYYY-MM-DD format)
+	dateStr := parts[1]
 	date, err := time.Parse("2006-01-02", dateStr)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("folder name is not a valid date: %s", dateStr)
@@ -172,11 +172,12 @@ func worker(
 		stats.totalFiles.Add(1)
 		current := stats.totalFiles.Load()
 
-		logger.Log("Worker %d - Processing [%d]: %s", id, current, job.RelativePath)
+		logger.Log("Worker %d - [%d] Processing: %s (dated %s)",
+			id, current, job.RelativePath, job.CreatedTime.Format("2006-01-02"))
 
 		// Check if file already exists in S3
 		if fileExistsInS3(ctx, s3Client, config.S3Bucket, job.RelativePath) {
-			logger.Log("  Worker %d - File already exists in S3, skipping", id)
+			logger.Log("  Worker %d - ⊘ File already exists in S3, skipping", id)
 			stats.skippedExisting.Add(1)
 			continue
 		}
@@ -190,14 +191,24 @@ func worker(
 			continue
 		}
 
+		// Get file size for logging
+		attrs, _ := gcsObj.Attrs(ctx)
+		var sizeStr string
+		if attrs != nil {
+			sizeMB := float64(attrs.Size) / (1024 * 1024)
+			sizeStr = fmt.Sprintf(" (%.2f MB)", sizeMB)
+		}
+
 		// Upload to S3
-		logger.Log("  Worker %d - Copying to s3://%s/%s...", id, config.S3Bucket, job.RelativePath)
+		logger.Log("  Worker %d - ⬆ Copying to S3%s...", id, sizeStr)
+		startTime := time.Now()
 		_, err = uploader.UploadWithContext(ctx, &s3manager.UploadInput{
 			Bucket: aws.String(config.S3Bucket),
 			Key:    aws.String(job.RelativePath),
 			Body:   reader,
 		})
 		reader.Close()
+		duration := time.Since(startTime)
 
 		if err != nil {
 			logger.Log("  Worker %d - ✗ Error uploading to S3: %v", id, err)
@@ -205,8 +216,9 @@ func worker(
 			continue
 		}
 
-		logger.Log("  Worker %d - ✓ Successfully copied", id)
-		stats.copiedFiles.Add(1)
+		copied := stats.copiedFiles.Add(1)
+		logger.Log("  Worker %d - ✓ Successfully copied in %.1fs (total: %d files)",
+			id, duration.Seconds(), copied)
 	}
 }
 
@@ -254,7 +266,13 @@ func main() {
 	}
 
 	s3Client := s3.New(sess)
-	uploader := s3manager.NewUploader(sess)
+
+	// Configure uploader for better performance
+	uploader := s3manager.NewUploader(sess, func(u *s3manager.Uploader) {
+		u.PartSize = 10 * 1024 * 1024 // 10MB parts (default is 5MB)
+		u.Concurrency = 5             // Upload 5 parts concurrently per file
+		u.LeavePartsOnError = false   // Clean up failed uploads
+	})
 
 	logger.Log("Starting migration from GCS to S3...")
 	logger.Log("Cutoff date: %s (only copying files from this date onwards)", config.CutoffDate.Format("2006-01-02"))
@@ -280,6 +298,12 @@ func main() {
 
 	filesQueued := 0
 	skippedByDate := 0
+	totalProcessed := 0
+
+	logger.Log("Scanning GCS bucket and queuing eligible files...")
+	logger.Log("(Files before %s will be skipped)", config.CutoffDate.Format("2006-01-02"))
+	logger.Log("")
+
 	for {
 		attrs, err := it.Next()
 		if err == iterator.Done {
@@ -300,47 +324,102 @@ func main() {
 			continue
 		}
 
+		totalProcessed++
+		logger.Log("Scanning [%d]: %s", totalProcessed, attrs.Name)
+
 		// Check folder date (primary filter)
 		folderDate, err := extractDateFromPath(attrs.Name)
 		if err != nil {
-			// If folder name is not a date, fall back to file creation time
-			if attrs.Created.Before(config.CutoffDate) {
-				skippedByDate++
-				continue
-			}
-		} else {
-			// Use folder date for filtering
-			if folderDate.Before(config.CutoffDate) {
-				skippedByDate++
-				continue
-			}
+			logger.Log("  ✗ Skipped: Could not extract valid date from path (%v)", err)
+			skippedByDate++
+			continue
 		}
+
+		// Use folder date for filtering
+		if folderDate.Before(config.CutoffDate) {
+			logger.Log("  ✗ Skipped: File dated %s (before %s)",
+				folderDate.Format("2006-01-02"), config.CutoffDate.Format("2006-01-02"))
+			skippedByDate++
+			continue
+		}
+
+		logger.Log("  ✓ Eligible: File dated %s - queuing for copy", folderDate.Format("2006-01-02"))
 
 		// Create job
 		job := FileJob{
 			GCSPath:      attrs.Name,
 			RelativePath: attrs.Name,
-			CreatedTime:  attrs.Created,
+			CreatedTime:  folderDate,
 		}
 
 		jobs <- job
 		filesQueued++
 	}
 
-	logger.Log("Skipped %d files before cutoff date %s", skippedByDate, config.CutoffDate.Format("2006-01-02"))
-
 	// Close jobs channel and wait for workers to finish
 	close(jobs)
-	logger.Log("Queued %d files for processing, waiting for workers to complete...", filesQueued)
+	logger.Log("")
+	logger.Log("=== Scanning Complete ===")
+	logger.Log("Total video files scanned: %d", totalProcessed)
+	logger.Log("Files skipped (before cutoff date): %d", skippedByDate)
+	logger.Log("Files queued for copying: %d", filesQueued)
+	logger.Log("")
+	logger.Log("=== Starting File Copy (20 workers in parallel) ===")
+	logger.Log("")
+
+	// Start a progress monitor
+	done := make(chan bool)
+	startProcessingTime := time.Now()
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				elapsed := time.Since(startProcessingTime)
+				processed := stats.totalFiles.Load()
+				rate := float64(processed) / elapsed.Seconds()
+				logger.Log("")
+				logger.Log("⏱ Progress Update (%.0fs elapsed, %.1f files/sec):", elapsed.Seconds(), rate)
+				logger.Log("   Processed: %d/%d files", processed, filesQueued)
+				logger.Log("   ✓ Copied: %d", stats.copiedFiles.Load())
+				logger.Log("   ⊘ Skipped (already exist): %d", stats.skippedExisting.Load())
+				logger.Log("   ✗ Errors: %d", stats.errorFiles.Load())
+				logger.Log("")
+			case <-done:
+				return
+			}
+		}
+	}()
+
 	wg.Wait()
+	done <- true
+	totalDuration := time.Since(startProcessingTime)
 
 	// Print statistics
-	logger.Log("================================")
-	logger.Log("Migration completed")
-	logger.Log("Total files processed: %d", stats.totalFiles.Load())
-	logger.Log("Files copied: %d", stats.copiedFiles.Load())
-	logger.Log("Files skipped (already exist): %d", stats.skippedExisting.Load())
-	logger.Log("Files skipped (before cutoff date): %d", stats.skippedDate.Load())
-	logger.Log("Errors: %d", stats.errorFiles.Load())
-	logger.Log("================================")
+	logger.Log("")
+	logger.Log("========================================")
+	logger.Log("           MIGRATION COMPLETE           ")
+	logger.Log("========================================")
+	logger.Log("")
+	logger.Log("Scanning Phase:")
+	logger.Log("  Total video files scanned: %d", totalProcessed)
+	logger.Log("  Files skipped (before cutoff %s): %d", config.CutoffDate.Format("2006-01-02"), skippedByDate)
+	logger.Log("  Files queued for copying: %d", filesQueued)
+	logger.Log("")
+	logger.Log("Processing Phase:")
+	logger.Log("  Total files processed: %d", stats.totalFiles.Load())
+	logger.Log("  ✓ Files copied to S3: %d", stats.copiedFiles.Load())
+	logger.Log("  ⊘ Files skipped (already exist): %d", stats.skippedExisting.Load())
+	logger.Log("  ✗ Errors: %d", stats.errorFiles.Load())
+	logger.Log("")
+	logger.Log("Performance:")
+	logger.Log("  Total time: %.1f seconds (%.1f minutes)", totalDuration.Seconds(), totalDuration.Minutes())
+	if stats.copiedFiles.Load() > 0 {
+		avgTime := totalDuration.Seconds() / float64(stats.copiedFiles.Load())
+		logger.Log("  Average time per file: %.1f seconds", avgTime)
+		logger.Log("  Processing rate: %.2f files/second", float64(stats.totalFiles.Load())/totalDuration.Seconds())
+	}
+	logger.Log("")
+	logger.Log("========================================")
 }
